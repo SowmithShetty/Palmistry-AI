@@ -31,6 +31,7 @@ Design decisions:
 import cv2
 import time
 import sys
+import numpy as np
 from collections import deque
 from tracker import HandTracker
 from processor import PalmProcessor
@@ -178,47 +179,93 @@ def draw_canny_info(frame, canny_low: int, canny_high: int) -> None:
     cv2.putText(frame, text, (12, y_offset + 4 + th), font, scale, color, thickness, cv2.LINE_AA)
 
 
+def _wrap_text(text: str, font, scale: float, thickness: int, max_width: int) -> list[str]:
+    """
+    Word-wrap *text* so that each returned line fits within *max_width*
+    pixels when rendered with the given font parameters.
+
+    Falls back to character-level wrapping if a single word is wider
+    than max_width (rare, but handles very long words gracefully).
+    """
+    words = text.split()
+    if not words:
+        return [""]
+
+    lines = []
+    current_line = words[0]
+
+    for word in words[1:]:
+        # Test whether appending the next word still fits.
+        test_line = current_line + " " + word
+        (tw, _), _ = cv2.getTextSize(test_line, font, scale, thickness)
+        if tw <= max_width:
+            current_line = test_line
+        else:
+            lines.append(current_line)
+            current_line = word
+
+    lines.append(current_line)
+    return lines
+
+
 def draw_reading(frame, reading: PalmistryReading) -> None:
     """
     Render the palmistry reading as a semi-transparent panel on the right
     side of the main feed.
 
-    The panel shows all three line readings (Heart, Head, Life) plus the
-    overall personality summary.  Each line gets a coloured label and a
-    one-line trait description.
+    Long detail strings are word-wrapped so they never clip at the frame
+    edge.  The panel height is calculated dynamically from the actual
+    number of wrapped lines.
     """
     h, w = frame.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.50
+    scale = 0.48
     thickness = 1
 
-    # Build the text lines with their colours.
-    # (text, colour) tuples.
-    entries = [
-        ("=== PALM READING ===", (255, 255, 255)),
-        ("", (0, 0, 0)),  # spacer
-        ("[Heart Line]", (100, 100, 255)),          # red-ish
-        (f"  {reading.heart['trait']}", (200, 200, 255)),
-        (f"  {reading.heart['detail']}", (180, 180, 180)),
-        ("", (0, 0, 0)),
-        ("[Head Line]", (255, 200, 100)),            # blue-ish
-        (f"  {reading.head['trait']}", (255, 220, 180)),
-        (f"  {reading.head['detail']}", (180, 180, 180)),
-        ("", (0, 0, 0)),
-        ("[Life Line]", (100, 255, 100)),            # green
-        (f"  {reading.life['trait']}", (180, 255, 180)),
-        (f"  {reading.life['detail']}", (180, 180, 180)),
-        ("", (0, 0, 0)),
-        ("[Overall]", (200, 200, 255)),
-        (f"  {reading.overall['trait']}", (220, 220, 255)),
-        (f"  {reading.overall['detail']}", (180, 180, 180)),
+    panel_w = 400
+    # Usable text width is the panel minus some internal padding.
+    text_max_w = panel_w - 20
+
+    # Build the raw entries: (text, colour, indent).
+    # indent=True adds left padding for sub-items.
+    raw_entries: list[tuple[str, tuple[int, int, int], bool]] = [
+        ("=== PALM READING ===", (255, 255, 255), False),
+        ("", (0, 0, 0), False),  # spacer
+        ("[Heart Line]", (100, 100, 255), False),
+        (reading.heart["trait"], (200, 200, 255), True),
+        (reading.heart["detail"], (180, 180, 180), True),
+        ("", (0, 0, 0), False),
+        ("[Head Line]", (255, 200, 100), False),
+        (reading.head["trait"], (255, 220, 180), True),
+        (reading.head["detail"], (180, 180, 180), True),
+        ("", (0, 0, 0), False),
+        ("[Life Line]", (100, 255, 100), False),
+        (reading.life["trait"], (180, 255, 180), True),
+        (reading.life["detail"], (180, 180, 180), True),
+        ("", (0, 0, 0), False),
+        ("[Overall]", (200, 200, 255), False),
+        (reading.overall["trait"], (220, 220, 255), True),
+        (reading.overall["detail"], (180, 180, 180), True),
     ]
 
-    line_height = 22
-    panel_h = len(entries) * line_height + 20
-    panel_w = 420
+    # Word-wrap every entry and flatten into (text, colour, x_offset) lines.
+    indent_px = 16
+    wrapped_lines: list[tuple[str, tuple[int, int, int], int]] = []
+    for text, color, indent in raw_entries:
+        offset = indent_px if indent else 0
+        if not text:
+            # Spacer — keep as an empty line.
+            wrapped_lines.append(("", color, 0))
+            continue
+        available_w = text_max_w - offset
+        for wline in _wrap_text(text, font, scale, thickness, available_w):
+            wrapped_lines.append((wline, color, offset))
+
+    line_height = 20
+    panel_h = len(wrapped_lines) * line_height + 24
+
     # Position: right side, vertically centred.
-    x_start = w - panel_w - 15
+    x_start = w - panel_w - 12
     y_start = max(10, (h - panel_h) // 2)
 
     # Draw a dark semi-transparent background panel.
@@ -230,14 +277,17 @@ def draw_reading(frame, reading: PalmistryReading) -> None:
         (20, 20, 20),
         cv2.FILLED,
     )
-    # Blend the overlay for a translucent effect (alpha = 0.75).
+    # Blend for a translucent effect (alpha = 0.75).
     cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
 
-    # Draw each text line.
-    y = y_start + 15
-    for text, color in entries:
-        if text:  # skip spacers
-            cv2.putText(frame, text, (x_start, y), font, scale, color, thickness, cv2.LINE_AA)
+    # Draw each wrapped line.
+    y = y_start + 14
+    for text, color, x_offset in wrapped_lines:
+        if text:
+            cv2.putText(
+                frame, text, (x_start + x_offset, y),
+                font, scale, color, thickness, cv2.LINE_AA,
+            )
         y += line_height
 
 
@@ -305,7 +355,6 @@ def main() -> None:
             if not roi_window_created:
                 cv2.namedWindow(ROI_WINDOW_NAME, cv2.WINDOW_NORMAL)
                 roi_window_created = True
-            cv2.imshow(ROI_WINDOW_NAME, roi_img)
 
             # ── Image processing (Milestone 3) ──
             # Run the CLAHE + Canny pipeline on the palm ROI.
@@ -317,15 +366,28 @@ def main() -> None:
                 edges_window_created = True
             cv2.imshow(EDGES_WINDOW_NAME, edges)
 
+            # Map landmarks to ROI coordinates
+            h_f, w_f = frame.shape[:2]
+            hand_landmarks = results.hand_landmarks[0]
+            landmarks_roi = np.array([
+                [int(lm.x * w_f) - bbox[0], int(lm.y * h_f) - bbox[1]]
+                for lm in hand_landmarks
+            ])
+
             # ── Palmistry analysis (Milestone 4) ──
-            # Debounce: only update the reading every READING_DEBOUNCE_SECS
-            # to avoid distracting flicker from frame-to-frame variation.
+            # We run analyze every frame to draw overlays on roi_img,
+            # but only update current_reading at a debounced interval.
             now_reading = time.perf_counter()
             if now_reading - last_reading_time >= READING_DEBOUNCE_SECS:
-                reading = analyze(edges)
+                reading = analyze(edges, landmarks_roi, roi_img)
                 if reading is not None:
                     current_reading = reading
                 last_reading_time = now_reading
+            else:
+                # Still analyze on intermediate frames to keep the overlays rendered.
+                analyze(edges, landmarks_roi, roi_img)
+
+            cv2.imshow(ROI_WINDOW_NAME, roi_img)
         else:
             # No hand detected — hide the secondary windows and clear reading.
             current_reading = None
