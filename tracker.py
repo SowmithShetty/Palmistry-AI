@@ -21,11 +21,12 @@ Design decisions:
     If two hands appear, MediaPipe picks the most confident one.
   - A configurable padding factor lets us expand the bounding box slightly
     so the palm edges are not clipped.
-  - The model file (hand_landmarker.task) must be downloaded once and
-    placed in the project root.
+  - The model file (hand_landmarker.task) is auto-downloaded on first run
+    if not already present.
 """
 
 import os
+import sys
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -41,8 +42,36 @@ from mediapipe.tasks.python.vision import drawing_utils, drawing_styles
 from typing import Optional
 
 
-# Path to the downloaded hand landmarker model file.
+# Path to the hand landmarker model file.
 _MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
+# Google-hosted URL for the float16 hand landmarker model.
+_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+)
+
+
+def _ensure_model() -> None:
+    """
+    Download the hand landmarker model if it doesn't already exist.
+
+    Uses urllib from the standard library so we don't need requests or
+    any additional dependency.  The model is ~7.8 MB — typically downloads
+    in a few seconds.
+    """
+    if os.path.isfile(_MODEL_PATH):
+        return
+
+    print("[INFO] Hand landmarker model not found.  Downloading (~7.8 MB)...")
+    try:
+        import urllib.request
+        urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+        print(f"[INFO] Model saved to: {_MODEL_PATH}")
+    except Exception as e:
+        print(f"[ERROR] Failed to download model: {e}")
+        print(f"[ERROR] Please download it manually from:\n  {_MODEL_URL}")
+        print(f"[ERROR] And place it at: {_MODEL_PATH}")
+        sys.exit(1)
 
 
 class HandTracker:
@@ -86,12 +115,8 @@ class HandTracker:
         """
         self.roi_padding = roi_padding
 
-        if not os.path.isfile(_MODEL_PATH):
-            raise FileNotFoundError(
-                f"Hand landmarker model not found at: {_MODEL_PATH}\n"
-                "Download it from: https://storage.googleapis.com/mediapipe-models/"
-                "hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
-            )
+        # Auto-download the model if missing.
+        _ensure_model()
 
         # Configure the HandLandmarker with the Tasks API.
         # RunningMode.VIDEO enables inter-frame tracking (faster than IMAGE

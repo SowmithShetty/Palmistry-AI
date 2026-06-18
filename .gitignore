@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# MediaPipe model (auto-downloaded on first run)
+hand_landmarker.task
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
