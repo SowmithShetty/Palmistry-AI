@@ -44,6 +44,7 @@ Design decisions:
 
 import json
 import os
+import cv2
 import numpy as np
 from typing import Optional
 
@@ -58,25 +59,20 @@ with open(_RULES_PATH, "r", encoding="utf-8") as f:
 
 
 # ─────────────────────────────────────────────
-# Classification thresholds (empirically tuned)
+# Classification thresholds (empirically tuned for landmark-masked zones)
 # ─────────────────────────────────────────────
 
-# Edge density: ratio of white pixels to total pixels in a zone.
-# These thresholds classify how "strong" or "faint" the lines are.
-DENSITY_STRONG = 0.06   # >6 % of pixels are edges → strong lines
-DENSITY_FAINT = 0.02    # <2 % → faint lines
-# (Between 2 % and 6 % is "normal" — we don't flag it either way.)
+# Edge density: ratio of white pixels to total mask pixels in a zone.
+DENSITY_STRONG = 0.022   # >2.2% of mask pixels are edges
+DENSITY_FAINT = 0.007    # <0.7% of mask pixels are edges
 
-# Edge extent: fraction of the zone's width that edges span.
-# This approximates the *length* of the line.
-EXTENT_LONG = 0.65      # Edges span >65 % of the width → long line
-EXTENT_SHORT = 0.35     # Edges span <35 % of the width → short line
-# (Between 35 % and 65 % is "medium".)
+# Edge extent/length score: longest contour length / reference distance.
+EXTENT_LONG = 0.55       # longest line length / reference distance >= 55%
+EXTENT_SHORT = 0.25      # longest line length / reference distance <= 25%
 
-# Overall palm classification: total edge density across the full ROI.
-OVERALL_MANY = 0.08     # Lots of fine lines everywhere
-OVERALL_CLEAR = 0.04    # Strong, clear primary lines
-# Below OVERALL_CLEAR → faint lines overall.
+# Overall palm classification: total edge density across the full palm mask.
+OVERALL_MANY = 0.035     # Abundant edges in the palm area
+OVERALL_CLEAR = 0.012    # Clear primary lines
 
 
 class PalmistryReading:
@@ -113,67 +109,95 @@ class PalmistryReading:
         return lines
 
 
+def _shrink_polygon(poly: np.ndarray, factor: float = 0.85) -> np.ndarray:
+    """
+    Shrink the vertices of a polygon towards its centroid.
+    This helps pull the region boundaries away from outer skin boundaries.
+    """
+    centroid = poly.mean(axis=0)
+    return centroid + factor * (poly - centroid)
+
+
 def _classify_zone(
-    edges: np.ndarray, y_start: int, y_end: int
+    edges: np.ndarray,
+    polygon_points: np.ndarray,
+    ref_dist: float,
+    roi_img: np.ndarray = None,
+    overlay_color: tuple[int, int, int] = (0, 255, 0),
+    line_name: str = ""
 ) -> tuple[str, str, float, float]:
     """
-    Analyse a horizontal slice of the edge map.
-
-    Parameters
-    ----------
-    edges : np.ndarray
-        The full Canny edge image (single-channel, 0/255).
-    y_start, y_end : int
-        The row range defining this zone.
-
-    Returns
-    -------
-    (length_class, strength_class, density, extent)
-        length_class  : "long" | "medium" | "short"
-        strength_class: "strong" | "faint" | "medium"  (medium = normal)
-        density       : raw density value (for debugging)
-        extent        : raw extent value (for debugging)
+    Analyse a specific region of the palm defined by the landmark polygon.
+    
+    We create a mask from the polygon, calculate the edge density inside it,
+    and find the longest contour (primary line) to estimate line length.
     """
-    zone = edges[y_start:y_end, :]
-    h, w = zone.shape
-
-    total_pixels = h * w
-    if total_pixels == 0:
+    h, w = edges.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon_points.astype(np.int32)], 255)
+    
+    zone_edges = cv2.bitwise_and(edges, edges, mask=mask)
+    
+    mask_area = np.count_nonzero(mask)
+    if mask_area == 0:
         return "short", "faint", 0.0, 0.0
-
-    # Count edge pixels (Canny outputs 255 for edges, 0 for background).
-    edge_count = np.count_nonzero(zone)
-    density = edge_count / total_pixels
-
-    # Calculate horizontal extent: find the leftmost and rightmost columns
-    # that contain at least one edge pixel.
-    col_has_edge = np.any(zone > 0, axis=0)  # boolean array of width w
-    if not np.any(col_has_edge):
-        # No edges at all in this zone.
-        return "short", "faint", density, 0.0
-
-    edge_cols = np.where(col_has_edge)[0]
-    left = edge_cols[0]
-    right = edge_cols[-1]
-    extent = (right - left + 1) / w
-
-    # Classify length based on extent.
-    if extent >= EXTENT_LONG:
+        
+    edge_count = np.count_nonzero(zone_edges)
+    density = edge_count / mask_area
+    
+    # Extract contours to trace lines
+    contours, _ = cv2.findContours(zone_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Filter contours: we only want reasonably long continuous segments, not small noise dots
+    min_contour_len = 15.0
+    valid_contours = []
+    for c in contours:
+        length = cv2.arcLength(c, closed=False)
+        if length >= min_contour_len:
+            valid_contours.append((c, length))
+            
+    if not valid_contours:
+        longest_len = 0.0
+    else:
+        # Sort by length descending
+        valid_contours.sort(key=lambda x: x[1], reverse=True)
+        longest_c, longest_len = valid_contours[0]
+        
+        # Draw the primary detected line contour in yellow on the ROI image
+        if roi_img is not None:
+            cv2.drawContours(roi_img, [longest_c], -1, (0, 255, 255), 2)
+            
+    # Draw zone overlay
+    if roi_img is not None:
+        cv2.polylines(roi_img, [polygon_points.astype(np.int32)], isClosed=True, color=overlay_color, thickness=1)
+        overlay = roi_img.copy()
+        cv2.fillPoly(overlay, [polygon_points.astype(np.int32)], overlay_color)
+        cv2.addWeighted(overlay, 0.15, roi_img, 0.85, 0, roi_img)
+        
+        # Label the zone near its centroid
+        cx, cy = polygon_points.mean(axis=0).astype(int)
+        cv2.putText(roi_img, line_name, (cx - 25, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        
+    # Scale-invariant length score: length relative to hand reference distance
+    length_score = longest_len / ref_dist if ref_dist > 0 else 0.0
+    
+    # Classify length
+    if length_score >= EXTENT_LONG:
         length_class = "long"
-    elif extent <= EXTENT_SHORT:
+    elif length_score <= EXTENT_SHORT:
         length_class = "short"
     else:
         length_class = "medium"
-
-    # Classify strength based on density.
+        
+    # Classify strength
     if density >= DENSITY_STRONG:
         strength_class = "strong"
     elif density <= DENSITY_FAINT:
         strength_class = "faint"
     else:
         strength_class = "medium"
-
-    return length_class, strength_class, density, extent
+        
+    return length_class, strength_class, density, length_score
 
 
 def _lookup_trait(line_key: str, length: str, strength: str) -> dict:
@@ -224,13 +248,14 @@ def _lookup_trait(line_key: str, length: str, strength: str) -> dict:
     }
 
 
-def _classify_overall(edges: np.ndarray) -> dict:
-    """Classify the overall palm based on total edge density."""
-    total = edges.size
-    if total == 0:
+def _classify_overall(edges: np.ndarray, palm_mask: np.ndarray) -> dict:
+    """Classify the overall palm based on total edge density inside the palm mask."""
+    mask_area = np.count_nonzero(palm_mask)
+    if mask_area == 0:
         return RULES.get("overall", {}).get("faint_lines", {})
 
-    density = np.count_nonzero(edges) / total
+    masked_edges = cv2.bitwise_and(edges, edges, mask=palm_mask)
+    density = np.count_nonzero(masked_edges) / mask_area
 
     if density >= OVERALL_MANY:
         key = "many_lines"
@@ -247,38 +272,89 @@ def _classify_overall(edges: np.ndarray) -> dict:
     }
 
 
-def analyze(edges: np.ndarray) -> Optional[PalmistryReading]:
+def analyze(
+    edges: np.ndarray,
+    landmarks_roi: np.ndarray,
+    roi_img: np.ndarray = None
+) -> Optional[PalmistryReading]:
     """
     Perform a full palmistry analysis on a Canny edge map of the palm ROI.
-
-    Parameters
-    ----------
-    edges : np.ndarray
-        Single-channel binary edge image (from processor.process()).
-
-    Returns
-    -------
-    PalmistryReading or None if the image is too small to analyse.
+    
+    Uses landmark-aligned zones and contour tracing for high accuracy.
+    Optionally draws shaded overlays and detected lines on the BGR roi_img.
     """
     h, w = edges.shape[:2]
-    if h < 30 or w < 30:
+    if h < 30 or w < 30 or landmarks_roi is None or len(landmarks_roi) < 21:
         return None
 
-    # Divide into three equal horizontal zones.
-    third = h // 3
-    top_start, top_end = 0, third                    # Heart line
-    mid_start, mid_end = third, 2 * third            # Head line
-    bot_start, bot_end = 2 * third, h                # Life line
+    # Retrieve key landmarks (x, y) relative to the ROI
+    L0 = landmarks_roi[0]   # Wrist
+    L1 = landmarks_roi[1]   # Thumb CMC
+    L2 = landmarks_roi[2]   # Thumb MCP
+    L5 = landmarks_roi[5]   # Index knuckle
+    L9 = landmarks_roi[9]   # Middle knuckle
+    L13 = landmarks_roi[13] # Ring knuckle
+    L17 = landmarks_roi[17] # Pinky knuckle
 
-    # Classify each zone.
-    heart_len, heart_str, _, _ = _classify_zone(edges, top_start, top_end)
-    head_len, head_str, _, _ = _classify_zone(edges, mid_start, mid_end)
-    life_len, life_str, _, _ = _classify_zone(edges, bot_start, bot_end)
+    # Define reference scale distances
+    ref_heart = np.linalg.norm(L17 - L5)
+    ref_head = np.linalg.norm(L17 - L5)
+    ref_life = np.linalg.norm(L5 - L0)
 
-    # Look up traits.
+    # 1. Heart Line Region (upper palm strip under knuckles)
+    poly_heart = np.array([
+        L17, L13, L9, L5,
+        L5 + 0.3 * (L0 - L5),
+        L17 + 0.35 * (L0 - L17)
+    ])
+    poly_heart_shrunk = _shrink_polygon(poly_heart, 0.85)
+
+    # 2. Head Line Region (middle palm strip)
+    poly_head = np.array([
+        L5 + 0.2 * (L0 - L5),
+        L9 + 0.2 * (L0 - L9),
+        L17 + 0.3 * (L0 - L17),
+        L17 + 0.6 * (L0 - L17),
+        L5 + 0.5 * (L0 - L5)
+    ])
+    poly_head_shrunk = _shrink_polygon(poly_head, 0.85)
+
+    # 3. Life Line Region (curves around the thumb eminence)
+    poly_life = np.array([
+        L5 + 0.25 * (L0 - L5),
+        L9 + 0.4 * (L0 - L9),
+        L0,
+        L1,
+        L2
+    ])
+    poly_life_shrunk = _shrink_polygon(poly_life, 0.85)
+
+    # 4. Overall Palm Region (for overall complexity/density analysis)
+    poly_overall = np.array([L0, L1, L2, L5, L9, L13, L17])
+    poly_overall_shrunk = _shrink_polygon(poly_overall, 0.85)
+
+    # Classify each line zone
+    # Heart line: Red overlay
+    heart_len, heart_str, _, _ = _classify_zone(
+        edges, poly_heart_shrunk, ref_heart, roi_img, (0, 0, 255), "Heart Line"
+    )
+    # Head line: Blue overlay
+    head_len, head_str, _, _ = _classify_zone(
+        edges, poly_head_shrunk, ref_head, roi_img, (255, 0, 0), "Head Line"
+    )
+    # Life line: Green overlay
+    life_len, life_str, _, _ = _classify_zone(
+        edges, poly_life_shrunk, ref_life, roi_img, (0, 255, 0), "Life Line"
+    )
+
+    # Construct the overall palm mask
+    palm_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(palm_mask, [poly_overall_shrunk.astype(np.int32)], 255)
+
+    # Look up traits in rules.json
     heart = _lookup_trait("heart_line", heart_len, heart_str)
     head = _lookup_trait("head_line", head_len, head_str)
     life = _lookup_trait("life_line", life_len, life_str)
-    overall = _classify_overall(edges)
+    overall = _classify_overall(edges, palm_mask)
 
     return PalmistryReading(heart, head, life, overall)
