@@ -1,143 +1,124 @@
 """
-processor.py — Image preprocessing & edge detection for palm line isolation.
+processor.py — Image preprocessing & deep learning-based edge detection for palm line isolation.
 
-Milestone 3: Image Preprocessing & Line Detection
----------------------------------------------------
-This module takes the cropped palm ROI and runs a multi-stage pipeline to
-isolate the major palm lines (Heart, Head, Life):
+This module replaces the traditional Canny edge detection pipeline with a neural network
+running Holistically-Nested Edge Detection (HED) locally in real-time.
 
-  1. **Grayscale conversion** — Removes colour information so we can work
-     purely on intensity gradients, which is what palm lines are.
-
-  2. **CLAHE (Contrast Limited Adaptive Histogram Equalization)** — Unlike
-     regular histogram equalization, CLAHE operates on small tiles and
-     clips the histogram to avoid amplifying noise.  This is critical for
-     palms because the lines are often faint against similarly-coloured
-     skin.  The clip limit and tile size are tunable.
-
-  3. **Gaussian Blur** — A low-pass filter that smooths out fine skin
-     texture (pores, wrinkles) while preserving the broader palm lines.
-     The kernel size controls the trade-off: larger = more noise removed
-     but also more line detail lost.
-
-  4. **Canny Edge Detection** — A two-threshold hysteresis algorithm that
-     finds strong edges (above the high threshold), weak edges (between
-     the thresholds), and keeps weak edges only if they're connected to
-     strong ones.  This is ideal for palm lines because it suppresses
-     isolated noise pixels while preserving continuous line structures.
-
-Design decisions:
-  - We expose the Canny thresholds as OpenCV trackbars so the user can
-    tune them in real-time without restarting the app.
-  - CLAHE clip limit and blur kernel size are also configurable but via
-    constructor args rather than trackbars (they change less often).
-  - The window for trackbars is created lazily on first call to avoid
-    empty windows when no hand is in view.
+It handles:
+  1. Grayscale conversion.
+  2. Contrast enhancement via CLAHE.
+  3. ImageNet mean subtraction and forward pass through the Caffe HED model.
+  4. Rescaling and thresholding the edge map to feed the palmistry analyzer.
 """
 
+import os
+import sys
 import cv2
 import numpy as np
+
+# ─────────────────────────────────────────────
+# HED Model Configuration & Auto-Download URLs
+# ─────────────────────────────────────────────
+_PROTO_PATH = os.path.join(os.path.dirname(__file__), "deploy.prototxt")
+_WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "hed_pretrained_bsds.caffemodel")
+
+_PROTO_URL = "https://raw.githubusercontent.com/ashukid/hed-edge-detector/master/deploy.prototxt"
+_WEIGHTS_URL = "https://github.com/ashukid/hed-edge-detector/raw/master/hed_pretrained_bsds.caffemodel"
+
+
+def _ensure_hed_models() -> None:
+    """Download the HED model definition and weights if they don't already exist."""
+    if os.path.isfile(_PROTO_PATH) and os.path.isfile(_WEIGHTS_PATH):
+        return
+
+    import urllib.request
+    
+    if not os.path.isfile(_PROTO_PATH):
+        print("[INFO] HED prototxt config not found. Downloading...")
+        try:
+            urllib.request.urlretrieve(_PROTO_URL, _PROTO_PATH)
+            print(f"[INFO] HED prototxt saved to: {_PROTO_PATH}")
+        except Exception as e:
+            print(f"[ERROR] Failed to download HED prototxt: {e}")
+            sys.exit(1)
+
+    if not os.path.isfile(_WEIGHTS_PATH):
+        print("[INFO] HED pretrained weights not found. Downloading (~29 MB)...")
+        try:
+            urllib.request.urlretrieve(_WEIGHTS_URL, _WEIGHTS_PATH)
+            print(f"[INFO] HED weights saved to: {_WEIGHTS_PATH}")
+        except Exception as e:
+            print(f"[ERROR] Failed to download HED weights: {e}")
+            sys.exit(1)
+
+
+# ─────────────────────────────────────────────
+# Custom HED Crop Layer for OpenCV DNN
+# ─────────────────────────────────────────────
+class CropLayer(object):
+    """
+    Custom crop layer required because the standard Caffe Crop layer 
+    is not parsed automatically by OpenCV's Caffe importer.
+    """
+    def __init__(self, params, blobs):
+        self.xstart = 0
+        self.xend = 0
+        self.ystart = 0
+        self.yend = 0
+
+    def getMemoryShapes(self, inputs):
+        inputShape, targetShape = inputs[0], inputs[1]
+        batchSize, numChannels = inputShape[0], inputShape[1]
+        height, width = targetShape[2], targetShape[3]
+        
+        self.ystart = int((inputShape[2] - targetShape[2]) / 2)
+        self.xstart = int((inputShape[3] - targetShape[3]) / 2)
+        self.yend = self.ystart + height
+        self.xend = self.xstart + width
+        
+        return [[batchSize, numChannels, height, width]]
+
+    def forward(self, inputs):
+        return [inputs[0][:, :, self.ystart:self.yend, self.xstart:self.xend]]
+
+
+# Register the Crop layer with OpenCV's DNN module
+try:
+    cv2.dnn_registerLayer('Crop', CropLayer)
+except Exception:
+    # If the module is reloaded, it might already be registered
+    pass
 
 
 class PalmProcessor:
     """
-    Multi-stage image processing pipeline for palm line extraction.
-
-    Usage:
-        processor = PalmProcessor()
-        edges = processor.process(roi_image)
+    Multi-stage image processing pipeline using deep learning-based HED
+    (Holistically-Nested Edge Detection) for palm line extraction.
     """
-
-    # Default Canny thresholds — good starting points for palm lines.
-    DEFAULT_CANNY_LOW = 30
-    DEFAULT_CANNY_HIGH = 100
-
-    # Trackbar window name.
-    TRACKBAR_WINDOW = "Edge Controls"
 
     def __init__(
         self,
         clahe_clip_limit: float = 2.5,
         clahe_tile_size: tuple[int, int] = (8, 8),
-        blur_kernel_size: int = 5,
     ):
-        """
-        Parameters
-        ----------
-        clahe_clip_limit : float
-            Contrast clipping limit for CLAHE.  Higher values give more
-            contrast but also more noise.  2.0–3.0 works well for skin.
-        clahe_tile_size : tuple[int, int]
-            Size of the tiles CLAHE divides the image into.  Smaller tiles
-            give more localised enhancement.  8×8 is a sensible default.
-        blur_kernel_size : int
-            Side length of the Gaussian blur kernel.  Must be odd.
-            5 gives a mild blur that preserves major lines.
-        """
-        # Ensure the blur kernel is odd (OpenCV requires it).
-        if blur_kernel_size % 2 == 0:
-            blur_kernel_size += 1
+        # Auto-download HED models if they are missing
+        _ensure_hed_models()
 
         self._clahe = cv2.createCLAHE(
             clipLimit=clahe_clip_limit,
             tileGridSize=clahe_tile_size,
         )
-        self._blur_ksize = blur_kernel_size
-
-        # Canny thresholds — will be controlled by trackbars.
-        self._canny_low = self.DEFAULT_CANNY_LOW
-        self._canny_high = self.DEFAULT_CANNY_HIGH
-
-        # Lazy init flag for the trackbar window.
-        self._trackbar_created = False
-
-    # ──────────────────────────────────────────────────
-    # Trackbar management
-    # ──────────────────────────────────────────────────
-
-    def _ensure_trackbars(self) -> None:
-        """
-        Create the trackbar window and sliders once, on first call.
-
-        We use a dedicated named window so the trackbars don't clutter
-        the main feed or the ROI window.
-        """
-        if self._trackbar_created:
-            return
-
-        cv2.namedWindow(self.TRACKBAR_WINDOW, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.TRACKBAR_WINDOW, 400, 150)
-
-        # Canny low threshold: 0–300
-        cv2.createTrackbar(
-            "Canny Low", self.TRACKBAR_WINDOW,
-            self._canny_low, 300,
-            self._on_canny_low,
-        )
-        # Canny high threshold: 0–500
-        cv2.createTrackbar(
-            "Canny High", self.TRACKBAR_WINDOW,
-            self._canny_high, 500,
-            self._on_canny_high,
-        )
-
-        self._trackbar_created = True
-
-    def _on_canny_low(self, val: int) -> None:
-        """Trackbar callback — update the low Canny threshold."""
-        self._canny_low = val
-
-    def _on_canny_high(self, val: int) -> None:
-        """Trackbar callback — update the high Canny threshold."""
-        self._canny_high = val
-
-    # ──────────────────────────────────────────────────
-    # Core processing pipeline
-    # ──────────────────────────────────────────────────
+        
+        # Load the HED neural network using OpenCV DNN
+        self.net = cv2.dnn.readNetFromCaffe(_PROTO_PATH, _WEIGHTS_PATH)
+        
+        # HED is typically trained on 256x256 or 500x500. 256x256 runs faster on CPU.
+        self.dnn_width = 256
+        self.dnn_height = 256
 
     def process(self, roi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Run the full preprocessing pipeline on a palm ROI image.
+        Run HED deep learning edge detection on a palm ROI image.
 
         Parameters
         ----------
@@ -147,60 +128,50 @@ class PalmProcessor:
         Returns
         -------
         (grayscale, clahe_enhanced, edges)
-            - grayscale: the raw grayscale conversion
-            - clahe_enhanced: after CLAHE + Gaussian blur
-            - edges: the final Canny edge map (binary, white-on-black)
-
-        All returned images have the same spatial dimensions as the input.
+            - grayscale: raw grayscale image
+            - clahe_enhanced: after CLAHE enhancement
+            - edges: final thresholded binary HED edge map
         """
-        # Ensure trackbars exist so the user can adjust thresholds.
-        self._ensure_trackbars()
-
-        # Step 1: Grayscale
-        # Colour adds no useful information for line detection and
-        # would triple the computation.
+        # Step 1: Grayscale conversion
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        # Step 2: CLAHE
-        # Adaptive histogram equalisation enhances the faint palm lines
-        # without blowing out already-bright regions (which regular
-        # equalisation would do).
+        # Step 2: CLAHE (Contrast Enhancement)
         enhanced = self._clahe.apply(gray)
-
-        # Step 3: Gaussian Blur
-        # Smooths out fine skin texture (pores, tiny wrinkles) that would
-        # otherwise produce noisy edges.  sigmaX=0 lets OpenCV compute the
-        # optimal sigma from the kernel size.
-        blurred = cv2.GaussianBlur(
-            enhanced,
-            (self._blur_ksize, self._blur_ksize),
-            sigmaX=0,
+        
+        # Step 3: Deep learning HED edge detection
+        # HED requires a 3-channel BGR input
+        enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        
+        h, w = roi.shape[:2]
+        
+        # Preprocess the image to construct an input blob
+        blob = cv2.dnn.blobFromImage(
+            enhanced_bgr,
+            scalefactor=1.0,
+            size=(self.dnn_width, self.dnn_height),
+            mean=(104.00698793, 116.66876762, 122.67891434),  # ImageNet RGB means
+            swapRB=False,
+            crop=False
         )
+        
+        self.net.setInput(blob)
+        hed_output = self.net.forward()
+        
+        # Rescale the output (squeezed to single channel)
+        hed_edges = np.squeeze(hed_output)
+        
+        # Resize HED output back to the original ROI size
+        hed_edges = cv2.resize(hed_edges, (w, h))
+        
+        # Convert back to CV_8U format [0, 255]
+        hed_edges = (hed_edges * 255.0).astype(np.uint8)
+        
+        # Apply a binary threshold to get a clean binary edge map
+        # HED outputs probabilities; thresholding at 100/255 maps directly to main lines
+        _, binary_edges = cv2.threshold(hed_edges, 100, 255, cv2.THRESH_BINARY)
 
-        # Step 4: Canny Edge Detection
-        # The two-threshold hysteresis approach is perfect for palm lines:
-        #   - Pixels with gradient > canny_high are "strong" edges (kept).
-        #   - Pixels between canny_low and canny_high are "weak" edges
-        #     (kept only if connected to a strong edge).
-        #   - Pixels below canny_low are discarded.
-        # This naturally filters out isolated noise while preserving the
-        # continuous structure of palm lines.
-        edges = cv2.Canny(blurred, self._canny_low, self._canny_high)
-
-        return gray, enhanced, edges
-
-    @property
-    def canny_low(self) -> int:
-        """Current Canny low threshold (for external inspection)."""
-        return self._canny_low
-
-    @property
-    def canny_high(self) -> int:
-        """Current Canny high threshold (for external inspection)."""
-        return self._canny_high
+        return gray, enhanced, binary_edges
 
     def destroy_windows(self) -> None:
-        """Destroy the trackbar window if it was created."""
-        if self._trackbar_created:
-            cv2.destroyWindow(self.TRACKBAR_WINDOW)
-            self._trackbar_created = False
+        """No-op, as no trackbar windows are created."""
+        pass

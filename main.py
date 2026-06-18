@@ -161,12 +161,11 @@ def draw_roi_box(frame, bbox: tuple[int, int, int, int]) -> None:
     )
 
 
-def draw_canny_info(frame, canny_low: int, canny_high: int) -> None:
+def draw_edge_info(frame, mode: str = "HED (Deep Learning)") -> None:
     """
-    Show the current Canny threshold values on the main feed so the user
-    can see the effect of their trackbar adjustments at a glance.
+    Show the current edge detection mode on the main feed.
     """
-    text = f"Canny: {canny_low}/{canny_high}"
+    text = f"Edge Mode: {mode}"
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.6
     thickness = 2
@@ -409,7 +408,7 @@ def main() -> None:
 
         # ── HUD overlays ──
         draw_fps(frame, fps)
-        draw_canny_info(frame, processor.canny_low, processor.canny_high)
+        draw_edge_info(frame, "HED (Deep Learning)")
         draw_instructions(frame, hand_detected)
 
         # ── Palmistry reading overlay (Milestone 4) ──
