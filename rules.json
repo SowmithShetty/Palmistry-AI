@@ -1,0 +1,85 @@
+{
+    "heart_line": {
+        "description": "The Heart Line — governs emotions, relationships, and emotional intelligence.",
+        "long": {
+            "trait": "Deeply Empathetic & Romantic",
+            "detail": "You form deep emotional bonds and express love freely."
+        },
+        "medium": {
+            "trait": "Emotionally Balanced",
+            "detail": "You have a healthy balance between emotion and reason in relationships."
+        },
+        "short": {
+            "trait": "Logical & Self-Focused",
+            "detail": "You value independence and tend to think before you feel."
+        },
+        "strong": {
+            "trait": "Emotionally Resilient",
+            "detail": "You handle emotional turbulence with grace and composure."
+        },
+        "faint": {
+            "trait": "Emotionally Sensitive",
+            "detail": "You are highly attuned to others' feelings and can be easily affected."
+        }
+    },
+    "head_line": {
+        "description": "The Head Line — represents intellect, decision-making, and mental clarity.",
+        "long": {
+            "trait": "Analytical Thinker",
+            "detail": "You approach problems methodically and enjoy complex challenges."
+        },
+        "medium": {
+            "trait": "Practical & Balanced Mind",
+            "detail": "You blend creativity with logic, making well-rounded decisions."
+        },
+        "short": {
+            "trait": "Decisive & Action-Oriented",
+            "detail": "You trust your instincts and prefer quick decisions over long deliberation."
+        },
+        "strong": {
+            "trait": "Sharp & Focused",
+            "detail": "Your mental clarity and concentration are exceptional."
+        },
+        "faint": {
+            "trait": "Dreamy & Imaginative",
+            "detail": "You are creative and introspective, often lost in thought."
+        }
+    },
+    "life_line": {
+        "description": "The Life Line — reflects vitality, life changes, and physical well-being.",
+        "long": {
+            "trait": "Vibrant & Full of Energy",
+            "detail": "You lead an active life with strong stamina and resilience."
+        },
+        "medium": {
+            "trait": "Steady & Grounded",
+            "detail": "You live a balanced, stable life with consistent energy."
+        },
+        "short": {
+            "trait": "Lives in the Moment",
+            "detail": "You embrace spontaneity and focus on the present."
+        },
+        "strong": {
+            "trait": "Physically Robust",
+            "detail": "Your physical constitution is strong and enduring."
+        },
+        "faint": {
+            "trait": "Gentle & Reflective",
+            "detail": "You lead a quieter, more contemplative life."
+        }
+    },
+    "overall": {
+        "clear_lines": {
+            "trait": "Strong Personality",
+            "detail": "Clear, well-defined palm lines suggest a decisive, confident character."
+        },
+        "faint_lines": {
+            "trait": "Gentle Soul",
+            "detail": "Softer lines indicate a reflective, sensitive temperament."
+        },
+        "many_lines": {
+            "trait": "Complex & Multi-Faceted",
+            "detail": "An abundance of fine lines reveals a rich inner life and varied experiences."
+        }
+    }
+}
